@@ -1,0 +1,119 @@
+-- Downloading mybible modules
+
+\connect "host=localhost port=54317"
+CREATE DATABASE mybible;
+\connect -reuse-previous=on dbname=mybible
+\conninfo
+\set ON_ERROR_STOP ON
+
+-- =======================================================
+
+CREATE SCHEMA IF NOT EXISTS registry;
+
+CREATE TABLE IF NOT EXISTS registry.registry_t (
+    version INT NOT NULL PRIMARY KEY,
+    json JSONB NOT NULL
+);
+
+DROP MATERIALIZED VIEW IF EXISTS registry.urls_mv;
+CREATE MATERIALIZED VIEW IF NOT EXISTS registry.urls_mv AS
+  WITH 
+  downloads AS (
+    SELECT t.version, d.abr, d.fil, 
+      RIGHT(SPLIT_PART(d.mask,'}',1),-1) alias, 
+      SPLIT_PART(d.mask,'}',2) fname
+    FROM registry.registry_t t, JSON_TABLE(t.json,
+      '$.downloads[*]' COLUMNS (
+        abr TEXT PATH '$.abr',
+        fil TEXT PATH '$.fil',
+        NESTED PATH '$.url[*]' COLUMNS (
+          mask TEXT PATH '$'
+        ))) d),
+  hosts AS (
+    SELECT t.version, h.alias, h.path, h.priority, h.weight
+    FROM registry.registry_t t, JSON_TABLE(t.json,
+      '$.hosts[*]' COLUMNS (
+        alias TEXT PATH '$.alias',
+        path TEXT PATH '$.path',
+        priority TEXT PATH '$.priority',
+        weight TEXT PATH '$.weight'
+      )) h)
+  SELECT d.version, d.abr, d.fil, 
+    REPLACE(h.path, '%s', d.fname) url, 
+    h.priority, h.weight, d.fname
+  FROM hosts h
+  JOIN downloads d ON (h.version, h.alias) = (d.version, d.alias)
+  ORDER BY d.abr
+WITH NO DATA;
+
+-- =======================================================
+
+\set info `wget -qO - http://mph4.ru/registry_info.json`
+SELECT RIGHT(:'info',-1)::JSONB->'version' AS version \gset
+
+SELECT NOT EXISTS(SELECT 1 FROM registry.registry_t r WHERE r.version = :version) AS notexists \gset
+\echo 'CURRENT VERSION' :version 'NOT EXISTS' :notexists
+
+\if :notexists
+    \set registry `wget -qO - http://mph4.ru/registry.zip | gunzip`
+    -- TODO registry zapis do pliku
+    WITH r AS (
+        SELECT RIGHT(:'registry',-1)::JSONB reg)
+    INSERT INTO registry.registry_t(version, json)
+    SELECT (r.reg->'version')::INT, r.reg 
+    FROM r ON CONFLICT DO NOTHING RETURNING version;
+\endif
+    
+REFRESH MATERIALIZED VIEW registry.urls_mv;
+
+-- =======================================================
+
+\cd ../../data/mybible
+-- error here => you are not in script path
+\cd ../../mybible/modules
+\echo `pwd`
+
+\out download_modules.sh
+\pset tuples_only on
+\pset border 0
+\pset format unaligned
+
+SELECT $$#!/usr/bin/bash
+rm ../../data/mybible/current
+date &&
+mkdir -p ../../data/mybible/$$||:version||$$ &&
+ln -s ../../data/mybible/$$||:version||$$ ../../data/mybible/current &&
+mkdir -p ../../data/mybible/current/_zipped &&
+mkdir -p ../../data/mybible/current/_unzipped &&
+mkdir -p ../../data/mybible/current/modules &&
+cd ../../data/mybible/current/_zipped && pwd &&
+for w in $$ || STRING_AGG('"'||fil||'^'||url||'"', ' ' ORDER BY abr, priority, weight DESC) || $$
+do 
+  IFS='^'; read -ra x <<< $w; fil=${x[0]}; url=${x[1]}; fname=$fil'.zip'
+  if [ ! -f $fname ]; then
+    wget -qO $fname $url
+    if [[ $? -ne 0 ]]; then
+      rm $fname 2>/dev/null
+      echo ======= ERROR $fil '|' $fname '|' $url ============
+    else 
+      IFS=$'\n'
+      unzip $fname -d ../_unzipped/$fil 
+      for f in `find ../_unzipped/$fil/.* -type f -exec basename {} \;`
+      do
+        mv ../_unzipped/$fil/$f ../_unzipped/$fil/$fil$f
+      done
+      cp -av --update=all ../_unzipped/$fil/. ../modules/
+      touch ../_unzipped/$fil/.processed
+    fi
+  fi
+done $$
+FROM registry.urls_mv WHERE version=:version AND abr LIKE '%%' LIMIT 20;
+
+\out
+\pset tuples_only off
+\pset border 1
+\pset format aligned
+
+\! ./download_modules.sh >> ../../data/mybible/download_log.txt
+
+

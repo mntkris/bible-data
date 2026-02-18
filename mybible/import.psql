@@ -1,0 +1,23 @@
+\set version 7637134
+
+\connect "host=localhost port=54317"
+
+CREATE DATABASE mb:version;
+\connect -reuse-previous=on dbname=mb:version
+\conninfo
+\set ON_ERROR_STOP ON
+
+\cd mybible/versions
+-- error here => you are not in project root
+\set path `pwd`
+\cd ../..
+\echo :path
+
+\ir ddl.sql
+
+CALL registry.download_registry(:version);
+CALL registry.download_modules(:'path');
+CALL registry.attach_modules(:'path');
+
+
+\echo '-- finished --'

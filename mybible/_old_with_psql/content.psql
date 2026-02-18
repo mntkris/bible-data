@@ -1,0 +1,449 @@
+-- Joining and materializing module tables
+
+\connect "host=localhost port=54317 dbname=mybible"
+
+--drop view registry.tables_v
+CREATE OR REPLACE VIEW registry.tables_v AS
+  SELECT table_schema schema, SPLIT_PART(table_schema,'.',1) abr, 
+    COALESCE(NULLIF(SPLIT_PART(table_schema,'.',2),''),'bible') type,
+    table_name name
+  FROM information_schema.tables
+  WHERE table_type='FOREIGN'
+    AND table_schema NOT IN (
+        -- BIBLE
+        -- info: non unique name
+        'LXXAJ+','LXXJ+','VIN-el+','HSB2+',
+        -- books: schema problem
+        'AMM','AMRNT','ARLNT','AZGNT','AZZNT','BB''2000','BCB','BDD','BDI','BK''99','BKD','BSB','BYSB','DAN','DRG',
+        'ECAV','ERV-awa','ERV-ta','GUN','HCHNT','HIX','Hmar','KBC','KEKB','LXX-TR''1894+','MBSI','MKug','MYU','MizB',
+        'Pinyin','ROH-AV','RSTI','RSTM','SK','SP''90','SPB','SSX','TCL1995','TCV','TOONT','TSAR','UZB','Vani','YKT',
+        'Йсф-Вин+','Йсф-Кас','Менге','НЗ(б)+ВЗ',
+        -- books_all: schema problem
+        'BHNT','EWUV','EWUVS','JrNT',' KCG''15','KDC','KMH','KPLN','KPXNT','KUD','KWJ','KYG','KZE','LCM','LXXe',
+        'MgalyunL','SP''90','WMTH-JM',
+        -- verses: non unique
+        'BLT','CCB','CCBS','KIST','UST','新遺詔聖經',
+        -- verses: schema
+        'AFR','ASZK','BWM''75','GOR','JF+','JFS+','KMS','RNT','t4t','回復訳','思高圣经','思高聖經',
+        -- introductions: non unique
+        'AST', '思高圣经',
+        -- introductions: schema
+        'EMTV','BJRD','LTT''15','LTT''18','LTT''2015',
+        -- stories: non unique
+        'BTI','CCB','CCBS','KPLN','NABRE','WCBS','ZION','回復訳',
+        -- DICTIONARY
+        -- info: non unique
+        'TStrongs.dictionary','la-ru-D.dictionary','DTE.dictionary','DCG.dictionary','Barclay.dictionary',
+        -- dictionary: schema
+        'suom.dictionary',
+        -- dictionary: non unique
+        'BDAGT.dictionary','BDAGcs.dictionary','BDAGct.dictionary','NUBD.dictionary','SC_Ges.dictionary',
+        '國語辭典.dictionary','王正中.dictionary','王正中(簡).dictionary','白雲曉.dictionary','白云晓.dictionary',
+        '粵語審音.dictionary','陈瑞庭.dictionary','陳瑞庭.dictionary',
+
+       ''
+    );
+
+select count(*) from information_schema._pg_foreign_servers;
+
+
+-- ---------------------------------------------------------------------------------
+-- TYPE: BIBLE ---------------------------------------------------------------------
+-- ---------------------------------------------------------------------------------
+DROP SCHEMA IF EXISTS _bible CASCADE;
+CREATE SCHEMA IF NOT EXISTS _bible;
+
+SELECT 
+'CREATE OR REPLACE VIEW _bible.info_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, name::text, value::text FROM %I.info',
+         t.schema, t.abr, t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+WHERE t.name='info' AND t.type='bible'
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _bible.info_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _bible.info_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    name::varchar(%s), value::text
+  FROM _bible.info_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)), max(length(name)))
+FROM _bible.info_v
+\gexec
+REFRESH MATERIALIZED VIEW _bible.info_mv;
+CREATE UNIQUE INDEX uq_bible_info_mv_name ON _bible.info_mv(abr, name);
+
+SELECT 
+'CREATE OR REPLACE VIEW _bible.books_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, book_number::text, book_color::text, short_name::text, long_name::text, %s sorting_order FROM %I.books',
+         t.schema, t.abr, COALESCE(c.column_name,'NULL')||'::text', t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t
+LEFT JOIN information_schema.columns c ON t.schema=c.table_schema AND c.table_name='books' AND c.column_name='sorting_order'
+WHERE t.name='books' AND t.type='bible'
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _bible.books_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _bible.books_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    book_number::int, book_color::varchar(%s), short_name::varchar(%s), long_name::varchar(%s), sorting_order::int
+  FROM _bible.books_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)), max(length(book_color)), max(length(short_name)), max(length(long_name)))
+FROM _bible.books_v
+\gexec
+REFRESH MATERIALIZED VIEW _bible.books_mv;
+CREATE UNIQUE INDEX uq_bible_books_book_number ON _bible.books_mv(abr,book_number);
+
+SELECT 
+'CREATE OR REPLACE VIEW _bible.books_all_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, book_number::text, book_color::text, short_name::text, %s title, long_name::text, is_present::text, %s sorting_order FROM %I.books_all',
+         t.schema, t.abr, COALESCE(c2.column_name,'NULL::text'), COALESCE(c1.column_name,'NULL::int'), t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+LEFT JOIN information_schema.columns c1 ON t.schema=c1.table_schema AND c1.table_name='books_all' AND c1.column_name='sorting_order'
+LEFT JOIN information_schema.columns c2 ON t.schema=c2.table_schema AND c2.table_name='books_all' AND c2.column_name='title'
+WHERE t.name='books_all' AND t.type='bible'
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _bible.books_all_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _bible.books_all_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    book_number::int, book_color::varchar(%s), short_name::varchar(%s), long_name::varchar(%s), is_present::bool, sorting_order::int
+  FROM _bible.books_all_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)), max(length(book_color)), max(length(short_name)), max(length(long_name)))
+FROM _bible.books_v
+\gexec
+REFRESH MATERIALIZED VIEW _bible.books_all_mv;
+CREATE UNIQUE INDEX uq_bible_books_all_book_number ON _bible.books_all_mv(abr,book_number);
+
+SELECT 
+'CREATE OR REPLACE VIEW _bible.verses_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, book_number::text, chapter::text, verse::text, text::text FROM %I.verses',
+         t.schema, t.abr, t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+WHERE t.name='verses' AND t.type='bible'
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _bible.verses_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _bible.verses_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    book_number::int, chapter::int, verse::int, text::text
+  FROM _bible.verses_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)))
+FROM _bible.verses_v
+\gexec
+REFRESH MATERIALIZED VIEW _bible.verses_mv;
+CREATE UNIQUE INDEX uq_bible_verses_mv_numer_chapter_verse ON _bible.verses_mv(abr, book_number, chapter, verse);
+
+SELECT 
+'CREATE OR REPLACE VIEW _bible.introductions_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, book_number::text, introduction::text FROM %I.introductions',
+         t.schema, t.abr, t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+WHERE t.name='introductions' AND t.type='bible'
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _bible.introductions_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _bible.introductions_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    book_number::int, introduction::text
+  FROM _bible.introductions_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)))
+FROM _bible.introductions_v
+\gexec
+REFRESH MATERIALIZED VIEW _bible.introductions_mv;
+CREATE UNIQUE INDEX uq_bible_introductions_mv_number ON _bible.introductions_mv(abr, book_number);
+
+SELECT 
+'CREATE OR REPLACE VIEW _bible.stories_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, book_number::text, chapter::text, verse::text, %s order_if_several, %s title FROM %I.stories',
+         t.schema, t.abr, COALESCE(c1.column_name,'NULL')||'::text', COALESCE(c2.column_name,'NULL')||'::text', t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+LEFT JOIN information_schema.columns c1 ON t.schema=c1.table_schema AND c1.table_name='stories' AND c1.column_name='order_if_several'
+LEFT JOIN information_schema.columns c2 ON t.schema=c2.table_schema AND c2.table_name='stories' AND c2.column_name='title'
+WHERE t.name='stories' AND t.type='bible'
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _bible.stories_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _bible.stories_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    book_number::int, chapter::int, verse::int, order_if_several::int, title::text
+  FROM _bible.stories_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)))
+FROM _bible.stories_v
+\gexec
+REFRESH MATERIALIZED VIEW _bible.stories_mv;
+CREATE UNIQUE INDEX uq_bible_stories_mv_number_chapter_verse_order ON _bible.stories_mv(abr, book_number, chapter, verse, order_if_several);
+
+SELECT 
+'CREATE OR REPLACE VIEW _bible.morphology_indications_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, indication::text, applicable_to::text, language::text, meaning::text FROM %I.morphology_indications',
+         t.schema, t.abr, t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+WHERE t.name='morphology_indications' AND t.type='bible' 
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _bible.morphology_indications_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _bible.morphology_indications_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    indication::varchar(%s), applicable_to::varchar(%s), language::varchar(%s), meaning::varchar(%s)
+  FROM _bible.morphology_indications_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)), max(length(indication)), greatest(max(length(applicable_to)),1), max(length(language)), max(length(meaning)))
+FROM _bible.morphology_indications_v
+\gexec
+REFRESH MATERIALIZED VIEW _bible.morphology_indications_mv;
+CREATE UNIQUE INDEX uq_bible_morphology_indications_mv_indication_applicable_lang ON _bible.morphology_indications_mv(abr, indication, applicable_to, language);
+
+/*  -- is empty, probably not used
+SELECT 
+'CREATE OR REPLACE VIEW _bible.morphology_topics_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, indication::text, topic::text FROM %I.morphology_topics',
+         t.schema, t.abr, t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+WHERE t.name='morphology_topics' AND t.type='bible' /*and left(t.schema,1) <= 'z'*/ AND t.schema NOT IN ('')
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _bible.morhology_topics_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _bible.morphology_topics_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    indication::text, topic::text
+  FROM _bible.morphology_topics_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)))
+FROM _bible.morphology_topics_v
+\gexec
+REFRESH MATERIALIZED VIEW _bible.morphology_topics_mv;
+CREATE UNIQUE INDEX uq_bible_morphology_topics_mv_indication ON _bible.morphology_topics_mv(abr, indication);
+*/
+
+-- ---------------------------------------------------------------------------------
+-- TYPE: DICTIONARY ---------------------------------------------------------------------
+-- ---------------------------------------------------------------------------------
+
+DROP SCHEMA IF EXISTS _dictionary CASCADE;
+CREATE SCHEMA IF NOT EXISTS _dictionary;
+
+SELECT 
+'CREATE OR REPLACE VIEW _dictionary.info_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, name::text, value::text FROM %I.info',
+         t.schema, t.abr, t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+WHERE t.name='info' AND t.type='dictionary'
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _dictionary.info_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _dictionary.info_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    name::varchar(%s), value::text
+  FROM _dictionary.info_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)), max(length(name)))
+FROM _dictionary.info_v
+\gexec
+REFRESH MATERIALIZED VIEW _dictionary.info_mv;
+CREATE UNIQUE INDEX uq_dictionary_info_mv_name ON _dictionary.info_mv(abr, name);
+
+SELECT 
+'CREATE OR REPLACE VIEW _dictionary.content_fragments_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, id::text, fragment::text FROM %I.content_fragments',
+         t.schema, t.abr, t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+WHERE t.name='content_fragments' AND t.type='dictionary'
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _dictionary.content_fragments_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _dictionary.content_fragments_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    id::varchar(%s), fragment::text
+  FROM _dictionary.content_fragments_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)), max(length(id)))
+FROM _dictionary.content_fragments_v
+\gexec
+REFRESH MATERIALIZED VIEW _dictionary.content_fragments_mv;
+CREATE UNIQUE INDEX uq_dictionary_content_fragments_mv_id ON _dictionary.content_fragments_mv(abr, id);
+
+SELECT 
+'CREATE OR REPLACE VIEW _dictionary.dictionary_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, topic::text, definition::text, %s short_definition, %s lexeme, %s transliteration, %s pronunciation FROM %I.dictionary',
+         t.schema, t.abr, 
+         COALESCE(c1.column_name,'NULL')||'::text', COALESCE(c2.column_name,'NULL')||'::text', 
+         COALESCE(c3.column_name,'NULL')||'::text', COALESCE(c4.column_name,'NULL')||'::text',t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+LEFT JOIN information_schema.columns c1 ON t.schema=c1.table_schema AND c1.table_name='dictionary' AND c1.column_name='short_definition'
+LEFT JOIN information_schema.columns c2 ON t.schema=c2.table_schema AND c2.table_name='dictionary' AND c2.column_name='lexeme'
+LEFT JOIN information_schema.columns c3 ON t.schema=c3.table_schema AND c3.table_name='dictionary' AND c3.column_name='transliteration'
+LEFT JOIN information_schema.columns c4 ON t.schema=c4.table_schema AND c4.table_name='dictionary' AND c4.column_name='pronunciation'
+WHERE t.name='dictionary' AND t.type='dictionary'
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _dictionary.dictionary_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _dictionary.dictionary_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    topic::text, definition::text, short_definition::varchar(%s), lexeme::text, transliteration::varchar(%s), pronunciation::varchar(%s)
+  FROM _dictionary.dictionary_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)), max(length(short_definition)), max(length(transliteration)), max(length(pronunciation)))
+FROM _dictionary.dictionary_v
+\gexec
+REFRESH MATERIALIZED VIEW _dictionary.dictionary_mv;
+CREATE UNIQUE INDEX uq_dictionary_dictionary_mv_topic ON _dictionary.dictionary_mv(abr, topic);
+
+SELECT 
+'CREATE OR REPLACE VIEW _dictionary.morphology_indications_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, indication::text, applicable_to::text, meaning::text FROM %I.morphology_indications',
+         t.schema, t.abr, t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+WHERE t.name='morphology_indications' AND t.type='dictionary'
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _dictionary.morphology_indications_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _dictionary.morphology_indications_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    indication::varchar(%s), applicable_to::varchar(%s), meaning::varchar(%s)
+  FROM _dictionary.morphology_indications_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)), max(length(indication)), max(length(applicable_to)), max(length(meaning)))
+FROM _dictionary.morphology_indications_v
+\gexec
+REFRESH MATERIALIZED VIEW _dictionary.morphology_indications_mv;
+CREATE UNIQUE INDEX uq_dictionary_morphology_indications_mv_indication_aplicable ON _dictionary.morphology_indications_mv(abr, indication, applicable_to);
+
+SELECT 
+'CREATE OR REPLACE VIEW _dictionary.morphology_topics_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, indication::text, topic::text FROM %I.morphology_topics',
+         t.schema, t.abr, t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+WHERE t.name='morphology_topics' AND t.type='dictionary'
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _dictionary.morphology_topics_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _dictionary.morphology_topics_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    indication::varchar(%s), topic::varchar(%s)
+  FROM _dictionary.morphology_topics_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)), max(length(indication)), max(length(topic)))
+FROM _dictionary.morphology_topics_v
+\gexec
+REFRESH MATERIALIZED VIEW _dictionary.morphology_topics_mv;
+CREATE UNIQUE INDEX uq_dictionary_morphology_topics_mv_indication_topic ON _dictionary.morphology_topics_mv(abr, indication, topic);
+
+SELECT 
+'CREATE OR REPLACE VIEW _dictionary.cognate_strong_numbers_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, group_id::text, strong_number::text FROM %I.cognate_strong_numbers',
+         t.schema, t.abr, t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+WHERE t.name='cognate_strong_numbers' AND t.type='dictionary'
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _dictionary.cognate_strong_numbers_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _dictionary.cognate_strong_numbers_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    group_id::int, strong_number::varchar(%s)
+  FROM _dictionary.cognate_strong_numbers_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)), max(length(strong_number)))
+FROM _dictionary.cognate_strong_numbers_v
+\gexec
+REFRESH MATERIALIZED VIEW _dictionary.cognate_strong_numbers_mv;
+CREATE UNIQUE INDEX uq_dictionary_cognate_strong_numbers_mv_group_number 
+  ON _dictionary.cognate_strong_numbers_mv(abr, group_id, strong_number);
+
+-- SYNONYMOUS_STRONG_NUMBERS absent
+
+SELECT 
+'CREATE OR REPLACE VIEW _dictionary.words_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, variation::text, standard_form::text, %s book_number, %s chapter_number, %s verse_number FROM %I.words',
+         t.schema, t.abr,
+         COALESCE(c1.column_name,'NULL')||'::text', COALESCE(c2.column_name,'NULL')||'::text', 
+         COALESCE(c3.column_name,'NULL')||'::text', t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+LEFT JOIN information_schema.columns c1 ON t.schema=c1.table_schema AND c1.table_name='words' AND c1.column_name='book_number'
+LEFT JOIN information_schema.columns c2 ON t.schema=c2.table_schema AND c2.table_name='words' AND c2.column_name='chapter_number'
+LEFT JOIN information_schema.columns c3 ON t.schema=c3.table_schema AND c3.table_name='words' AND c3.column_name='verse_number'
+WHERE t.name='words' AND t.type='dictionary'
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _dictionary.words_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _dictionary.words_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    variation::varchar(%s), standard_form::varchar(%s), book_number::int, chapter_number::int, verse_number::int
+  FROM _dictionary.words_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)), max(length(variation)), max(length(standard_form)))
+FROM _dictionary.words_v
+\gexec
+REFRESH MATERIALIZED VIEW _dictionary.words_mv;
+-- CREATE UNIQUE INDEX uq_dictionary_words_mv_variation  ON _dictionary.words_mv(abr, variation);
+
+SELECT 
+'CREATE OR REPLACE VIEW _dictionary.words_processing_v AS
+' || STRING_AGG(FORMAT(
+        '  SELECT %L module, %L abr, type::text, input::text, output::text FROM %I.words_processing',
+         t.schema, t.abr, t.schema
+      ), E' UNION ALL\n') || ';'
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+WHERE t.name='words_processing' AND t.type='dictionary'
+\gexec
+DROP MATERIALIZED VIEW IF EXISTS _dictionary.words_processing_mv;
+SELECT FORMAT(
+'CREATE MATERIALIZED VIEW IF NOT EXISTS _dictionary.words_processing_mv AS
+  SELECT module::varchar(%s), abr::varchar(%s),
+    type::varchar(%s), input::varchar(%s), output::varchar(%s)
+  FROM _dictionary.words_processing_v
+WITH NO DATA;',
+max(length(module)), max(length(abr)), max(length(type)), max(length(input)), max(length(output)))
+FROM _dictionary.words_processing_v
+\gexec
+REFRESH MATERIALIZED VIEW _dictionary.words_processing_mv;
+CREATE UNIQUE INDEX uq_dictionary_words_processing_mv_type_input 
+  ON _dictionary.words_processing_mv(abr, type, input);
+
+/*
+\o tmp.xxx
+select format(
+  'select %L; select max(%L), max(book_number::int), max(chapter::int), max(verse::numeric), max(%s) order_if_several, max(%s) title from %I.stories;',
+  t.schema, t.schema, COALESCE(c1.column_name,'NULL')||'::text', COALESCE(c2.column_name,'NULL')||'::text', t.schema)
+FROM registry.tables_v t JOIN information_schema.tables tt ON (t.schema,t.name)=(tt.table_schema,tt.table_name) 
+LEFT JOIN information_schema.columns c1 ON t.schema=c1.table_schema AND c1.table_name='stories' AND c1.column_name='order_if_several'
+LEFT JOIN information_schema.columns c2 ON t.schema=c2.table_schema AND c2.table_name='stories' AND c2.column_name='title'
+WHERE t.name='stories' AND t.type='bible' and schema like '%%'
+order by t.schema
+\gexec
+\q
+*/

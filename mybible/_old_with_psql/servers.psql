@@ -1,0 +1,58 @@
+-- Creating schemas for each module
+
+\connect "host=localhost port=54317 dbname=mybible"
+\echo `pwd`
+
+\cd `pwd`/../../data/mybible/current/modules
+\echo `pwd`
+\set workdir `pwd`
+
+\set modules `ls -1 *.SQLite3`
+
+CREATE EXTENSION IF NOT EXISTS sqlite_fdw;
+
+SELECT  $$
+DROP SERVER IF EXISTS "$$||foreign_server_name||$$" CASCADE;
+DROP SCHEMA IF EXISTS "$$||foreign_server_name||$$" CASCADE;
+$$
+FROM information_schema._pg_foreign_servers
+WHERE foreign_server_type='module'
+\gexec
+
+WITH modules AS (
+  SELECT replace(u,'.SQLite3','') m FROM UNNEST(STRING_TO_ARRAY(:'modules', E'\n')) u)
+SELECT $$
+CREATE SERVER IF NOT EXISTS "$$||m||$$" TYPE 'module'
+FOREIGN DATA WRAPPER sqlite_fdw OPTIONS (database $$||quote_literal(concat(:'workdir','/',m,'.SQLite3'))||$$);
+CREATE SCHEMA IF NOT EXISTS "$$||m||$$";
+IMPORT FOREIGN SCHEMA public FROM SERVER "$$||m||$$" INTO "$$||m||$$";
+$$
+FROM modules m
+\gexec
+
+-- fixes --
+
+ALTER FOREIGN TABLE "SDictCZ.dictionary".dictionary
+  ALTER COLUMN topic TYPE text,
+  ALTER COLUMN definition TYPE TEXT,
+  ALTER COLUMN short_definition TYPE text,
+  ALTER COLUMN lexeme TYPE text,
+  ALTER COLUMN transliteration TYPE text,
+  ALTER COLUMN pronunciation TYPE text;
+
+ALTER FOREIGN TABLE "Strong.dictionary".dictionary
+  ALTER COLUMN topic TYPE text,
+  ALTER COLUMN definition TYPE TEXT,
+  ALTER COLUMN short_definition TYPE text,
+  ALTER COLUMN lexeme TYPE text,
+  ALTER COLUMN transliteration TYPE text,
+  ALTER COLUMN pronunciation TYPE text;
+
+ALTER FOREIGN TABLE "THESV.dictionary".dictionary
+  ALTER COLUMN topic TYPE text,
+  ALTER COLUMN definition TYPE TEXT,
+  ALTER COLUMN short_definition TYPE text,
+  ALTER COLUMN lexeme TYPE text,
+  ALTER COLUMN transliteration TYPE text,
+  ALTER COLUMN pronunciation TYPE text;
+
