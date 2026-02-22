@@ -19,5 +19,8 @@ CALL registry.download_registry(:version);
 CALL registry.download_modules(:'path');
 CALL registry.attach_modules(:'path');
 
+CALL registry.validate_bible_modules();
+CALL registry.accumulate_bible_modules();
+
 
 \echo '-- finished --'
